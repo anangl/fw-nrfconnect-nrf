@@ -45,6 +45,7 @@ LOG_MODULE_REGISTER(at_host, CONFIG_SLM_LOG_LEVEL);
 
 #define AT_MAX_CMD_LEN	CONFIG_AT_CMD_RESPONSE_MAX_LEN
 #define UART_RX_LEN	8  /* UART FIFO depth is 6 (?) */
+#define UART_RX_TIMEOUT 10 /* in milliseconds */
 
 /** @brief Termination Modes. */
 enum term_modes {
@@ -69,9 +70,9 @@ static size_t at_buf_len;
 static struct k_work cmd_send_work;
 static const char termination[3] = { '\0', '\r', '\n' };
 
-static u8_t uart_rx_buf[UART_RX_LEN];
+static u8_t uart_rx_buf[2][UART_RX_LEN];
+static u8_t uart_rx_buf_idx;
 static u8_t *uart_tx_buf;
-static u8_t buf_num;
 
 static K_SEM_DEFINE(tx_done, 0, 1);
 
@@ -331,8 +332,11 @@ static void cmd_send(struct k_work *work)
 
 done:
 	k_sleep(K_MSEC(100)); /* allow time for TX DMA */
-	buf_num = 1U;
-	err = uart_rx_enable(uart_dev, &uart_rx_buf[0], 1, SYS_FOREVER_MS);
+	uart_rx_buf_idx = 0;
+	err = uart_rx_enable(uart_dev,
+			     uart_rx_buf[uart_rx_buf_idx],
+			     sizeof(uart_rx_buf[uart_rx_buf_idx]),
+			     UART_RX_TIMEOUT);
 	if (err) {
 		LOG_ERR("UART RX failed: %d", err);
 		rsp_send(FATAL_STR, sizeof(FATAL_STR) - 1);
@@ -430,15 +434,19 @@ static void uart_callback(struct uart_event *evt, void *user_data)
 		LOG_INF("TX_ABORTED");
 		break;
 	case UART_RX_RDY:
-		uart_rx_handler(evt->data.rx.buf[0]);
+		for (int i = 0; i < evt->data.rx.len; ++i) {
+			uart_rx_handler(
+				evt->data.rx.buf[evt->data.rx.offset + i]);
+		}
 		break;
 	case UART_RX_BUF_REQUEST:
-		err = uart_rx_buf_rsp(uart_dev, &uart_rx_buf[buf_num], 1);
+		uart_rx_buf_idx = 1 - uart_rx_buf_idx;
+		err = uart_rx_buf_rsp(uart_dev,
+				      uart_rx_buf[uart_rx_buf_idx],
+				      sizeof(uart_rx_buf[uart_rx_buf_idx]));
 		if (err) {
 			LOG_WRN("UART RX buf rsp: %d", err);
 		}
-		buf_num++;
-		buf_num %= UART_RX_LEN;
 		break;
 	case UART_RX_BUF_RELEASED:
 		break;
@@ -503,8 +511,11 @@ int slm_at_host_init(void)
 	/* Power on UART module */
 	device_set_power_state(uart_dev, DEVICE_PM_ACTIVE_STATE,
 				NULL, NULL);
-	buf_num = 1U;
-	err = uart_rx_enable(uart_dev, &uart_rx_buf[0], 1, SYS_FOREVER_MS);
+	uart_rx_buf_idx = 0;
+	err = uart_rx_enable(uart_dev,
+			     uart_rx_buf[uart_rx_buf_idx],
+			     sizeof(uart_rx_buf[uart_rx_buf_idx]),
+			     UART_RX_TIMEOUT);
 	if (err) {
 		LOG_ERR("Cannot enable rx: %d", err);
 		return -EFAULT;
